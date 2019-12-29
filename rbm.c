@@ -1,4 +1,4 @@
-// Compiled: gcc -std=gnu99 -Ofast -o rbm_openblas rbm_openblas.c -lm -lopenblas 
+// Compiled: gcc -std=gnu99 -Ofast -o rbm rbm.c -lm -lopenblas 
 // (ignore the warning on the return value of fscanf)
 
 #include <stdio.h>
@@ -10,7 +10,7 @@
 
 #define EPOCHS        7000
 #define OUTPUT_EPOCHS 10
-#define AVERAGES      1
+#define AVERAGES      10
 #define BATCH_SIZE    30    // Datasize, if no batch required
 #define VARIANCE      0.001
 #define MOMENTUM      0.0   // must be < 1
@@ -21,7 +21,7 @@
 #define HIDDEN        16
 
 // RAND_MAX is 2147483647
-#define rnd() ((double)random()/RAND_MAX)
+#define rnd()         ((double)random()/RAND_MAX)
 #define SIGMOID(X)    (1.0 / (1.0 + exp(-(X))))
 
 // auxiliary functions
@@ -165,10 +165,11 @@ void RBNLearningCDK(
   // for (int i=0; i < HIDDEN * VISIBLES; ++i) w[i] = VARIANCE * (2 * rnd() - 1);
   // for (int i=0; i < HIDDEN; ++i)            b[i] = VARIANCE * (2 * rnd() - 1);
   // for (int i=0; i < VISIBLES; ++i)          c[i] = VARIANCE * (2 * rnd() - 1);
-
+  
+  // initializing weights randomly uniform in [-VARIANCE, VARIANCE] and biases to zero
   for (int i=0; i < HIDDEN * VISIBLES; ++i) w[i] = VARIANCE * (2 * rnd() - 1);
-  for (int i=0; i < HIDDEN; ++i)            b[i] = 0;
-  for (int i=0; i < VISIBLES; ++i)          c[i] = 0;
+  memcpy(b, Db0, HIDDEN*sizeof(double));
+  memcpy(c, Dc0, VISIBLES*sizeof(double));
   
   for (int il=0; il < EPOCHS; ++il) {  // EPOCHS iterations
 
@@ -183,66 +184,76 @@ void RBNLearningCDK(
     int NBATCHES = dataSize / BATCH_SIZE;
     for (int ib=0; ib < NBATCHES; ++ib) {  // NBATCHES times process mini-batch
 
-      // process every data in the mini-batch
+      // update mini-batch, i.e. process every data in the mini-batch
+
+      // REAL_SIZE will be the number of training data in the minibatch
       int limitBatch = (ib + 1)*BATCH_SIZE;
       double REAL_SIZE = (limitBatch > dataSize) ? (dataSize - ib * BATCH_SIZE) : BATCH_SIZE;
-      
+
+      // Temporary values for the average of the weights/biases increment over the mini-batch
       memcpy(nabla_w_mb, Dw0, HIDDEN*VISIBLES*sizeof(double));
       memcpy(nabla_b_mb, Db0, HIDDEN*sizeof(double));
       memcpy(nabla_c_mb, Dc0, VISIBLES*sizeof(double));
     
-      for (int id = ib * BATCH_SIZE; (id < limitBatch) && (id < dataSize); ++id ) {
+      for (int id = ib * BATCH_SIZE; (id < limitBatch) && (id < dataSize); ++id ) {  // for every element data[id] in the mini-batch...
         
         // Computing intermediate values that are going to be used
         // more than once: pHData
-        memcpy(pHData, b, HIDDEN * sizeof(double)); // for (int j=0; j < HIDDEN; ++j)  pHData[j] = b[j];
-        cblas_dgemv (CblasRowMajor, CblasNoTrans, HIDDEN, VISIBLES, 1.0, w, VISIBLES, data[id], 1, 1.0, pHData,  1);
-        for (int j=0; j < HIDDEN; ++j)
-          pHData[j]  = SIGMOID(pHData[j]);
+        memcpy(pHData, b, HIDDEN * sizeof(double)); // for (int j=0; j < HIDDEN; ++j)  pHData[j] = b[j]; that is, pHData = b
+        cblas_dgemv (CblasRowMajor, CblasNoTrans, HIDDEN, VISIBLES, 1.0, w, VISIBLES, data[id], 1, 1.0, pHData,  1); // pHData += w * data[id]
+        for (int j=0; j < HIDDEN; ++j) pHData[j]  = SIGMOID(pHData[j]); // pHData = SIGMOID(pHData)
         
-        // Gibbs Sampling
+        // ===== Gibbs Sampling ===============================================================
+        
         // 1.- Initialize with observed data 
-        memcpy(xGibbs, data[id], VISIBLES * sizeof(double)); // for (int i=0; i < VISIBLES; ++i) xGibbs[i] = data[id][i];
-        memcpy(tmph, pHData, HIDDEN * sizeof(double)); 
+        memcpy(xGibbs, data[id], VISIBLES * sizeof(double)); // for (int i=0; i < VISIBLES; ++i) xGibbs[i] = data[id][i]; or xGibbs = data[id]
+        memcpy(tmph, pHData, HIDDEN * sizeof(double));       // tmph = pHData -- we use what we have already calculated
+
         // 2.- Iterate CDK-1 times
         for (int i=0; i < CDK-1; ++i) {
-          for (int j=0; j < HIDDEN; ++j) hGibbs[j] = (rnd() < tmph[j]) ? 1 : 0;	  
           
-          memcpy(tmpv,c,VISIBLES * sizeof(double)); // for (int i=0; i < VISIBLES; ++i) tmpv[i] = c[i];
-          cblas_dgemv (CblasRowMajor, CblasTrans,   HIDDEN, VISIBLES, 1.0, w, VISIBLES, hGibbs, 1, 1.0, tmpv, 1);
+          // 3.- sample h: hGibbs = binomial(n=1, p=tmph)
+          for (int j=0; j < HIDDEN; ++j) hGibbs[j] = (rnd() < tmph[j]) ? 1 : 0;	// we assume tmph has the sigmoid "in it"  
+
+          memcpy(tmpv,c,VISIBLES * sizeof(double)); // for (int i=0; i < VISIBLES; ++i) tmpv[i] = c[i]; or tmpv = c
+          cblas_dgemv (CblasRowMajor, CblasTrans,   HIDDEN, VISIBLES, 1.0, w, VISIBLES, hGibbs, 1, 1.0, tmpv, 1); // tmpv += w' * hGibbs
+          // 4.- sample x: xGibbs = binomial(n=1, p=SIGMOID(tmpv))
           for (int j=0; j < VISIBLES; ++j) xGibbs[j] = (rnd() < SIGMOID(tmpv[j])) ? 1 : 0;	  
 
-          memcpy(tmph,b,HIDDEN * sizeof(double)); // for (int i=0; i < HIDDEN; ++i) tmph[i] = b[i];
-          cblas_dgemv (CblasRowMajor, CblasNoTrans, HIDDEN, VISIBLES, 1.0, w, VISIBLES, xGibbs, 1, 1.0, tmph, 1);
-          for (int j=0; j < HIDDEN; ++j) tmph[j] = SIGMOID(tmph[j]);
-        }
-        // End of Gibbs Sampling
+          memcpy(tmph,b,HIDDEN * sizeof(double)); // for (int i=0; i < HIDDEN; ++i) tmph[i] = b[i]; or tmph = b
+          cblas_dgemv (CblasRowMajor, CblasNoTrans, HIDDEN, VISIBLES, 1.0, w, VISIBLES, xGibbs, 1, 1.0, tmph, 1); // tmph += w * xGibbs
+          for (int j=0; j < HIDDEN; ++j) tmph[j] = SIGMOID(tmph[j]);  // tmph = SIGMOID(tmph)
+          
+        } //  for (int i=0; i < CDK-1; ++i)
 	
-        // Last iteration: No sampling, but probabilities.
-        for (int j=0; j < HIDDEN; ++j) hGibbs[j] = (rnd() < tmph[j]) ? 1 : 0;	  
-        memcpy(tmpv,c,VISIBLES * sizeof(double)); // for (int i=0; i < VISIBLES; ++i) tmpv[i] = c[i];
-        cblas_dgemv (CblasRowMajor, CblasTrans,   HIDDEN, VISIBLES, 1.0, w, VISIBLES, hGibbs, 1, 1.0, tmpv, 1); 
+        // Last iteration: No sampling, but probabilities (Hinton).        
+        for (int j=0; j < HIDDEN; ++j) hGibbs[j] = (rnd() < tmph[j]) ? 1 : 0; // sample h: hGibbs = binomial(n=1, p=tmph)
+        memcpy(tmpv,c,VISIBLES * sizeof(double)); // for (int i=0; i < VISIBLES; ++i) tmpv[i] = c[i]; or tmpv = c
+        cblas_dgemv (CblasRowMajor, CblasTrans,   HIDDEN, VISIBLES, 1.0, w, VISIBLES, hGibbs, 1, 1.0, tmpv, 1); // tmpv += w' * hGibbs
         for (int j=0; j < VISIBLES; ++j) xGibbs[j] = SIGMOID(tmpv[j]);	  
-                        
+
+        // ===== End of Gibbs Sampling. Result --> xGibbs ========================================
+        
         // Computing intermediate values that are going to be used
         // more than once: pHGibbs
-        memcpy(pHGibbs,b, HIDDEN * sizeof(double)); // for (int j=0; j < HIDDEN; ++j) pHGibbs[j] = b[j];
-        cblas_dgemv (CblasRowMajor, CblasNoTrans, HIDDEN, VISIBLES, 1.0, w, VISIBLES, xGibbs,   1, 1.0, pHGibbs, 1);
-        for (int j=0; j < HIDDEN; ++j)
-          pHGibbs[j] = SIGMOID(pHGibbs[j]);
+        memcpy(pHGibbs,b, HIDDEN * sizeof(double)); // for (int j=0; j < HIDDEN; ++j) pHGibbs[j] = b[j]; or pHGibbs = b
+        cblas_dgemv (CblasRowMajor, CblasNoTrans, HIDDEN, VISIBLES, 1.0, w, VISIBLES, xGibbs,   1, 1.0, pHGibbs, 1); // pHGibbs += w * xGibbs
+        for (int j=0; j < HIDDEN; ++j) pHGibbs[j] = SIGMOID(pHGibbs[j]); // pHGibbs = SIGMOID(pHGibbs)
 
+        // we add the derivatives (for weights and biases)
         for (int i=0; i < VISIBLES; ++i)   nabla_c_mb[i] += data[id][i] - xGibbs[i];
         for (int i=0; i < HIDDEN; ++i)     nabla_b_mb[i] += pHData[i] - pHGibbs[i];
         for (int i=0; i < HIDDEN; ++i)
           for (int j=0; j < VISIBLES; ++j) nabla_w_mb[i*VISIBLES + j] += (pHData[i] * data[id][j] - pHGibbs[i] * xGibbs[j]);
         
       } // for (int id = ib * BATCH_SIZE; (id < limitBatch) && (id < dataSize); ++id )
-      
+
+      // we average the derivatives for this mini-batch
       for (int i=0; i < HIDDEN * VISIBLES; ++i) nabla_w_mb[i] /= REAL_SIZE;
       for (int i=0; i < HIDDEN;   ++i)          nabla_b_mb[i] /= REAL_SIZE;
       for (int i=0; i < VISIBLES; ++i)          nabla_c_mb[i] /= REAL_SIZE;
 
-      // Increment Dw[][], Db[] and Dc[] - Learning Rule
+      // Increment Dw[][], Db[] and Dc[] - Learning Rule -- We use Dw, Db and Dc to keep track of the values needed to compute momentum
       for (int i=0; i < HIDDEN * VISIBLES; ++i) Dw[i] = MOMENTUM * Dw[i] + LRATE * (nabla_w_mb[i] - (WEIGHTDECAY/dataSize) * w[i]);
       for (int i=0; i < HIDDEN;   ++i)          Db[i] = MOMENTUM * Db[i] + LRATE * (nabla_b_mb[i] - (WEIGHTDECAY/dataSize) * b[i]);
       for (int i=0; i < VISIBLES; ++i)          Dc[i] = MOMENTUM * Dc[i] + LRATE * (nabla_c_mb[i] - (WEIGHTDECAY/dataSize) * c[i]); 
@@ -272,7 +283,7 @@ void RBNLearningCDK(
       points[il/OUTPUT_EPOCHS] += log_likelihood;
       // if ((il % 10000) == 0) printf("Epoch: %d -> ll= %5.5lf\n", il, log_likelihood);
       // printf("[DEBUG]-------> %d %5.2lf\n",il/OUTPUT_EPOCHS, log_likelihood);
-      printf("%d\t%f\t%f\n", il, log_likelihood, sum_probs);
+      // printf("%d\t%f\t%f\n", il, log_likelihood, sum_probs);
     }
     
   } // for (int il=0; il < EPOCHS; ++il)
@@ -343,10 +354,13 @@ int main (int argc, char *argv[]) {
   b = (double *)malloc(HIDDEN * sizeof(double));
 
   // Compute results...
-  for (int i=0; i < AVERAGES; ++i) RBNLearningCDK((const double **)data, datasize, w, b, c, points);
-
+  for (int i=0; i < AVERAGES; ++i) {
+    // fprintf(stderr, "Run number %d\n", i);
+    RBNLearningCDK((const double **)data, datasize, w, b, c, points);
+  }
+  
   // Output results
-  //for (int i=0; i < num_points; ++i) printf("%d\t%f\n", i*OUTPUT_EPOCHS, points[i]/AVERAGES);
+  for (int i=0; i < num_points; ++i) printf("%d\t%f\n", i*OUTPUT_EPOCHS, points[i]/AVERAGES);
 
   // free allocated space
   free((double *)b);
